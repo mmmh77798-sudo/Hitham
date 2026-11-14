@@ -2,7 +2,6 @@ services:
   - type: web
     name: lughz-haitham-duel
     runtime: python
-    rootDir: server
     plan: free
     buildCommand: python -m py_compile server.py
     startCommand: python server.py
