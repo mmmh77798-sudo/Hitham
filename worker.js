@@ -70,6 +70,20 @@ export default {
 
     const action = url.pathname.slice('/api/'.length);
     const payload = await bodyJson(request);
+    if (action === 'teamCreate') {
+      const name = String(payload.name || '').trim().slice(0, 24) || 'لاعب';
+      const rounds = Math.max(5, Math.min(20, Number(payload.rounds) || 10));
+      const answerSeconds = Math.max(8, Math.min(30, Number(payload.answerSeconds) || 15));
+      const teamId = payload.teamId === 'blue' ? 'blue' : 'red';
+      for (let i = 0; i < 8; i++) {
+        const code = randomCode();
+        const stub = env.ROOMS.get(env.ROOMS.idFromName(code));
+        const response = await callDO(stub, 'teamCreate', { code, name, rounds, answerSeconds, teamId });
+        const result = await response.json();
+        if (result.ok || result.error !== 'collision') return json(result);
+      }
+      return json(error('تعذر إنشاء كود فريد. أعد المحاولة.'), 503);
+    }
     if (action === 'create') {
       const name = String(payload.name || '').trim().slice(0, 24) || 'لاعب';
       const rounds = Math.max(5, Math.min(20, Number(payload.rounds) || 10));
@@ -130,7 +144,55 @@ export class Room extends DurableObject {
       return json(out);
     }
 
+    if (action === 'teamCreate') {
+      if (m) return json(error('collision'));
+      const pid = randomHex(6);
+      const token = randomHex(10);
+      const teamId = b.teamId === 'blue' ? 'blue' : 'red';
+      const rounds = Math.max(5, Math.min(20, Number(b.rounds) || 10));
+      const answerSeconds = Math.max(8, Math.min(30, Number(b.answerSeconds) || 15));
+      m = {
+        code, mode: 'team', created: Date.now(), hostId: pid,
+        players: [{ id: pid, token, name: String(b.name || '').trim().slice(0, 24) || 'لاعب', teamId }],
+        teams: {
+          red: { id: 'red', name: 'الفريق الأحمر', score: 0, answer: null },
+          blue: { id: 'blue', name: 'الفريق الأزرق', score: 0, answer: null },
+        },
+        phase: 'lobby', rounds, answerSeconds, readSeconds: READ_SECONDS,
+        qorder: [], qi: 0, holder: null, tried: [], sub: 'reading', deadline: 0,
+        reveal: null, events: [], winner: null,
+      };
+      this.push(m, 'أُنشئت غرفة فريق العباقرة. شارك الرمز مع الفريقين.');
+      await this.ctx.storage.put('match', m);
+      await this.ctx.storage.setAlarm(Date.now() + ROOM_TTL_MS);
+      const out = this.teamView(m, pid);
+      out.pid = pid; out.token = token;
+      return json(out);
+    }
+
     if (!m || m.code !== code) return json(error('الكود غير صحيح أو انتهت صلاحية الغرفة.'));
+
+    if (action === 'teamJoin') {
+      if (m.mode !== 'team') return json(error('هذا الرمز لغرفة منافسة فردية، وليس فريق العباقرة.'));
+      if (m.phase !== 'lobby') return json(error('بدأت المنافسة بالفعل، لا يمكن الانضمام الآن.'));
+      const teamId = b.teamId === 'blue' ? 'blue' : b.teamId === 'red' ? 'red' : '';
+      if (!teamId) return json(error('اختر الفريق الأحمر أو الأزرق.'));
+      const count = m.players.filter((player) => player.teamId === teamId).length;
+      if (count >= 10) return json(error('اكتمل الحد الأقصى لهذا الفريق: ١٠ لاعبين. اختر الفريق الآخر.'));
+      const pid = randomHex(6);
+      const token = randomHex(10);
+      const name = String(b.name || '').trim().slice(0, 24) || 'لاعب';
+      m.players.push({ id: pid, token, name, teamId });
+      this.push(m, 'انضم ' + name + ' إلى ' + m.teams[teamId].name + ' (' + (count + 1) + '/10).');
+      await this.ctx.storage.put('match', m);
+      const out = this.teamView(m, pid);
+      out.pid = pid; out.token = token;
+      return json(out);
+    }
+
+    if (action === 'join' && m.mode === 'team') {
+      return json(error('هذه غرفة فريقية. اختر لون الفريق ثم استخدم «انضم إلى فريق العباقرة».'));
+    }
 
     if (action === 'join') {
       if (m.phase !== 'lobby') return json(error('بدأت المنافسة بالفعل، لا يمكن الدخول الآن.'));
@@ -161,7 +223,58 @@ export class Room extends DurableObject {
       return json(this.view(m, pid));
     }
 
+    if (action === 'teamStart') {
+      if (m.mode !== 'team') return json(error('هذا ليس قسم فريق العباقرة.'));
+      if (m.hostId !== pid) return json(error('منشئ الغرفة فقط يستطيع بدء المنافسة.'));
+      if (m.phase !== 'lobby') return json(error('المنافسة جارية بالفعل.'));
+      for (const teamId of ['red', 'blue']) {
+        if (m.players.filter((player) => player.teamId === teamId).length === 0) {
+          return json(error('يجب وجود لاعب واحد على الأقل في كل فريق قبل البدء.'));
+        }
+      }
+      this.startTeam(m);
+      await this.ctx.storage.put('match', m);
+      return json(this.teamView(m, pid));
+    }
+
+    if (action === 'teamBegin') {
+      if (m.mode !== 'team') return json(error('هذا ليس قسم فريق العباقرة.'));
+      if (m.phase !== 'playing' || m.sub !== 'reading') return json(error('مؤقت الإجابة غير جاهز للبدء.'));
+      this.beginAnswering(m);
+      this.push(m, 'بدأ وقت إجابة الفريقين. تُعتمد أول إجابة من كل فريق.');
+      await this.ctx.storage.put('match', m);
+      return json(this.teamView(m, pid));
+    }
+
+    if (action === 'teamAnswer') {
+      if (m.mode !== 'team') return json(error('هذا ليس قسم فريق العباقرة.'));
+      this.tick(m);
+      if (m.phase !== 'playing' || m.sub !== 'answering') {
+        await this.ctx.storage.put('match', m);
+        return json(error('انتهى وقت الإجابة أو لم يبدأ بعد.'));
+      }
+      if (Number(b.qi) !== m.qi) return json(error('انتهى هذا السؤال، انتظر السؤال التالي.'));
+      const team = m.teams[me.teamId];
+      if (!team) return json(error('لم يتم تعيينك إلى فريق.'));
+      if (team.answer) return json(error('أرسل فريقك إجابته بالفعل؛ تُحتسب أول إجابة فقط.'));
+      const option = Number(b.option);
+      if (!Number.isInteger(option) || option < 0 || option > 3) return json(error('اختر أحد الخيارات.'));
+      const q = QUESTIONS[m.qorder[m.qi]];
+      const correct = option === q.a;
+      const left = Math.max(0, Math.ceil((m.deadline - Date.now()) / 1000));
+      const points = correct ? 10 + Math.min(left, m.answerSeconds) : 0;
+      team.answer = { playerId: pid, name: me.name, option, correct, points };
+      team.score += points;
+      this.push(m, 'أرسل ' + me.name + ' إجابةً عن ' + team.name + '.');
+      if (m.teams.red.answer && m.teams.blue.answer) {
+        this.finishTeamQuestion(m, 'أجاب الفريقان عن السؤال.');
+      }
+      await this.ctx.storage.put('match', m);
+      return json(this.teamView(m, pid));
+    }
+
     if (action === 'start') {
+      if (m.mode === 'team') return json(error('استخدم زر بدء منافسة فريق العباقرة.'));
       if (m.players[0].id !== pid) return json(error('صاحب الغرفة فقط يبدأ المنافسة.'));
       if (m.players.length < 2) return json(error('بانتظار دخول المنافس بالكود.'));
       if (m.phase !== 'lobby') return json(error('المنافسة جارية بالفعل.'));
@@ -206,6 +319,7 @@ export class Room extends DurableObject {
     }
 
     if (action === 'answer') {
+      if (m.mode === 'team') return json(error('استخدم إجابة الفريق من قسم فريق العباقرة.'));
       if (m.phase !== 'playing') return json(error('المنافسة غير جارية.'));
       if (m.sub !== 'answering' || m.holder !== pid) {
         await this.ctx.storage.put('match', m);
@@ -229,6 +343,22 @@ export class Room extends DurableObject {
     }
 
     if (action === 'leave') {
+      if (m.mode === 'team') {
+        m.players = m.players.filter((player) => player.id !== pid);
+        if (m.players.length === 0) {
+          await this.ctx.storage.delete('match');
+          await this.ctx.storage.deleteAlarm();
+          return json({ ok: true, left: true });
+        }
+        if (m.hostId === pid) {
+          m.hostId = m.players[0].id;
+          this.push(m, 'انتقلت صلاحية إدارة الغرفة إلى ' + m.players[0].name + '.');
+        } else {
+          this.push(m, me.name + ' غادر الغرفة.');
+        }
+        await this.ctx.storage.put('match', m);
+        return json({ ok: true, left: true });
+      }
       if (m.phase === 'lobby' && m.players[0].id === pid) {
         await this.ctx.storage.delete('match');
         await this.ctx.storage.deleteAlarm();
@@ -243,6 +373,151 @@ export class Room extends DurableObject {
 
     await this.ctx.storage.put('match', m);
     return json(error('طلب غير معروف.'));
+  }
+
+  startTeam(m) {
+    const all = Array.from({ length: QUESTIONS.length }, (_, i) => i);
+    for (let i = all.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [all[i], all[j]] = [all[j], all[i]];
+    }
+    m.qorder = all.slice(0, Math.min(m.rounds, QUESTIONS.length));
+    m.qi = 0;
+    m.phase = 'playing';
+    m.sub = 'reading';
+    m.deadline = Date.now() + m.readSeconds * 1000;
+    m.reveal = null;
+    m.winner = null;
+    for (const team of Object.values(m.teams)) {
+      team.score = 0;
+      team.answer = null;
+    }
+    this.push(m, 'بدأت منافسة فريق العباقرة! السؤال الأول ظاهر للفريقين.');
+  }
+  finishTeamQuestion(m, reason) {
+    const q = QUESTIONS[m.qorder[m.qi]];
+    const details = ['red', 'blue'].map((id) => {
+      const team = m.teams[id];
+      if (!team.answer) return team.name + ' لم يرسل إجابة';
+      return team.name + (team.answer.correct
+        ? ' أجاب إجابة صحيحة وحصل على ' + ar(team.answer.points) + ' نقطة'
+        : ' أجاب إجابة خاطئة ولم يحصل على نقاط');
+    }).join('، ');
+    m.reveal = {
+      correctIndex: q.a,
+      explanation: q.e,
+      points: 0,
+      winner: null,
+      reason: reason + ' ' + details,
+    };
+    m.sub = 'reveal';
+    m.deadline = Date.now() + REVEAL_SECONDS * 1000;
+    this.push(m, m.reveal.reason);
+  }
+  advanceTeam(m) {
+    if (m.qi + 1 >= m.rounds) {
+      m.phase = 'finished';
+      m.sub = 'done';
+      m.deadline = 0;
+      const red = m.teams.red;
+      const blue = m.teams.blue;
+      if (red.score === blue.score) {
+        m.winner = { tie: true, teamId: null, name: 'تعادل', score: red.score };
+      } else {
+        const winner = red.score > blue.score ? red : blue;
+        m.winner = { tie: false, teamId: winner.id, name: winner.name, score: winner.score };
+      }
+      this.push(m, 'انتهت المنافسة: ' + (m.winner.tie
+        ? 'تعادل الفريقان'
+        : 'فاز ' + m.winner.name));
+      return;
+    }
+    m.qi++;
+    for (const team of Object.values(m.teams)) team.answer = null;
+    m.reveal = null;
+    m.sub = 'reading';
+    m.deadline = Date.now() + m.readSeconds * 1000;
+    this.push(m, 'السؤال ' + ar(m.qi + 1) + ' متاح الآن للفريقين.');
+  }
+  tickTeam(m) {
+    if (m.phase !== 'playing' || !m.deadline || Date.now() < m.deadline) return;
+    if (m.sub === 'reading') {
+      this.beginAnswering(m);
+      this.push(m, 'بدأ وقت إجابة الفريقين. تُعتمد أول إجابة من كل فريق.');
+    } else if (m.sub === 'answering') {
+      this.finishTeamQuestion(m, 'انتهى وقت الإجابة.');
+    } else if (m.sub === 'reveal') {
+      this.advanceTeam(m);
+    }
+  }
+  teamView(m, pid) {
+    const me = this.player(m, pid);
+    if (!me) return error('جلسة غير صالحة. أعد الدخول بالكود.');
+    const teams = ['red', 'blue'].map((id) => {
+      const team = m.teams[id];
+      const revealAnswer = m.sub === 'reveal' || m.phase === 'finished';
+      return {
+        id: team.id,
+        name: team.name,
+        score: team.score,
+        answered: !!team.answer,
+        answerName: team.answer ? team.answer.name : null,
+        answer: revealAnswer && team.answer ? {
+          playerId: team.answer.playerId,
+          name: team.answer.name,
+          option: team.answer.option,
+          correct: team.answer.correct,
+          points: team.answer.points,
+        } : null,
+        players: m.players.filter((player) => player.teamId === id).map((player) => ({
+          id: player.id,
+          name: player.name,
+          isHost: m.hostId === player.id,
+        })),
+      };
+    });
+    const myTeam = m.teams[me.teamId];
+    let status = '';
+    let timerTotal = 0;
+    if (m.phase === 'lobby') status = 'بانتظار انضمام اللاعبين وبدء المنافسة';
+    else if (m.sub === 'reading') {
+      status = 'اقرؤوا السؤال؛ يستطيع أي لاعب بدء المؤقت، أو يبدأ تلقائيًا بعد ٥ ثوانٍ.';
+      timerTotal = m.readSeconds * 1000;
+    } else if (m.sub === 'answering') {
+      status = myTeam.answer
+        ? 'أرسل فريقك إجابته؛ بانتظار الفريق الآخر أو انتهاء الوقت.'
+        : 'أجب باسم فريقك؛ تُعتمد أول إجابة يرسلها أحد أعضائه.';
+      timerTotal = m.answerSeconds * 1000;
+    } else if (m.sub === 'reveal') {
+      status = 'نتيجة السؤال — الإجابة الصحيحة ظاهرة.';
+      timerTotal = REVEAL_SECONDS * 1000;
+    }
+    return {
+      ok: true,
+      mode: 'team',
+      code: m.code,
+      serverNow: Date.now(),
+      phase: m.phase,
+      sub: m.sub,
+      status,
+      round: m.phase === 'playing' ? m.qi + 1 : m.qi,
+      total: m.rounds,
+      answerSeconds: m.answerSeconds,
+      readSeconds: m.readSeconds,
+      yourTurn: m.phase === 'playing' && m.sub === 'answering' && !myTeam.answer,
+      you: { id: me.id, name: me.name, teamId: me.teamId, isHost: m.hostId === pid },
+      teams,
+      question: this.questionView(m, pid),
+      remainingMs: m.deadline ? Math.max(0, Math.floor(m.deadline - Date.now())) : 0,
+      timerTotalMs: timerTotal,
+      reveal: m.sub === 'reveal' || m.phase === 'finished'
+        ? { ...(m.reveal || {}), teams: teams.map((team) => ({
+            id: team.id, name: team.name, score: team.score, answer: team.answer,
+          })) }
+        : null,
+      winner: m.phase === 'finished' ? m.winner : null,
+      events: m.events.slice(-6).map((event) => event.text),
+    };
   }
 
   player(m, pid) { return m.players.find((p) => p.id === pid) || null; }
@@ -298,6 +573,10 @@ export class Room extends DurableObject {
     this.beginReading(m, next.id, 'السؤال ' + ar(m.qi + 1) + ' مع ' + next.name);
   }
   tick(m) {
+    if (m.mode === 'team') {
+      this.tickTeam(m);
+      return;
+    }
     if (m.phase !== 'playing' || !m.deadline || Date.now() < m.deadline) return;
     if (m.sub === 'reading') this.beginAnswering(m);
     else if (m.sub === 'answering') this.fail(m, m.holder, 'انتهى الوقت');
@@ -318,7 +597,9 @@ export class Room extends DurableObject {
   questionView(m, pid) {
     if (m.phase !== 'playing' || !m.qorder.length) return null;
     const q = QUESTIONS[m.qorder[m.qi]];
-    const visible = m.holder === pid || m.sub === 'reveal' || m.sub === 'done';
+    const visible = m.mode === 'team'
+      ? true
+      : m.holder === pid || m.sub === 'reveal' || m.sub === 'done';
     if (!visible) return null;
     const v = { text: q.q, options: q.o, chapter: q.c, difficulty: q.d };
     if (m.sub === 'reveal' && m.reveal) {
@@ -328,6 +609,7 @@ export class Room extends DurableObject {
     return v;
   }
   view(m, pid) {
+    if (m.mode === 'team') return this.teamView(m, pid);
     const me = this.player(m, pid);
     const opp = this.other(m, pid);
     const isHolder = m.holder === pid && m.phase === 'playing';

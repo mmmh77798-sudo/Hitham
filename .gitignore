@@ -1,0 +1,14 @@
+.dart_tool/
+.pub-cache/
+node_modules/
+.wrangler/
+.packages
+.idea/
+.vscode/
+build/
+dist/
+*.log
+android/.gradle/
+android/local.properties
+android/app/build/
+android/app/src/main/res/mipmap-*/ic_launcher.png.bak

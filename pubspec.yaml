@@ -1,0 +1,18 @@
+name: lughz_haitham
+description: "لغز هيثم — ٥٠٠ سؤال معلومات عامة صعب مع خيارات"
+publish_to: 'none'
+version: 4.3.0+505
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+flutter:
+  uses-material-design: true
