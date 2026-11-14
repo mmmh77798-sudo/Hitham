@@ -1,0 +1,22 @@
+قسم العباقرة — نشر Cloudflare Workers
+======================================
+
+هذا بديل Render المختار لتجنب شاشة إضافة بطاقة. يستخدم Worker على workers.dev، وDurable Object مع تخزين SQLite للحفاظ على غرف المباريات بين طلبات الخادم وإيقاظه. لا يحتاج نطاقًا خاصًا. تحتاج إلى إنشاء/تفعيل حساب Cloudflare وربط GitHub؛ قد يطلب Cloudflare تحقق الحساب، فلا تدخل بطاقة إن لم ترغب.
+
+1) ارفع ملفات الحزمة إلى جذر مستودع GitHub Hitham، بجانب render.yaml وserver.py:
+   worker.js, page.js, questions.json, wrangler.jsonc, package.json, package-lock.json, .nvmrc
+   استبدل questions.json بالنسخة الموجودة في الحزمة إذا طلب GitHub ذلك؛ هما بنك الـ500 سؤال نفسه.
+2) افتح https://dash.cloudflare.com/ وأنشئ/افتح حسابك.
+3) من Workers & Pages اختر Create application → GitHub، ثم وافق على تطبيق Cloudflare Workers & Pages واختر المستودع Hitham والفرع main.
+4) اكتب اسم Worker كما هو في wrangler.jsonc: lughz-haitham-geniuses. أبق Root directory على / (جذر المستودع). Build command: npm ci. Deploy command: npx wrangler deploy.
+5) فعّل workers.dev إن طُلب، ثم Save and Deploy.
+6) بعد نجاح النشر سيكون العنوان https://lughz-haitham-geniuses.<subdomain>.workers.dev . اختبر /api/health؛ المتوقع questions: 500.
+7) أرسل لي النطاق (ليس أي سر) لأضبطه افتراضيًا في APK وأبني نسخة نهائية.
+
+إن ظهر خطأ في إنشاء الحساب أو ربط GitHub، أرسل صورة الخطأ. لا ترسل كلمة مرور أو API token.
+
+ملاحظات:
+- Durable Objects SQLite مدعومة في Workers Free، بحدود يومية للاستخدام موضحة في تسعير Cloudflare.
+- جلسات المنافسة محفوظة لكل كود في Durable Object؛ تُحذف بعد ساعتين من إنشاء الغرفة.
+- هذا إعداد تجريبي صغير؛ لم يختبر على حساب Cloudflare أو على هاتفين فعليين بعد. يجب اختبار الرابط بعد النشر قبل اعتماد APK.
+- وجود render.yaml في الجذر لا يؤثر في Workers؛ يمكن إبقاؤه.
