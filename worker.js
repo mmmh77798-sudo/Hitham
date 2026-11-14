@@ -120,7 +120,7 @@ export class Room extends DurableObject {
         players: [{ id: pid, token, name: String(b.name || '').trim().slice(0, 24) || 'لاعب', score: 0 }],
         phase: 'lobby', rounds, answerSeconds, readSeconds: READ_SECONDS,
         qorder: [], qi: 0, holder: null, tried: [], sub: 'reading', deadline: 0,
-        reveal: null, events: [], winner: null,
+        reveal: null, events: [], winner: null, rematchVotes: [],
       };
       this.push(m, 'أُنشئت الغرفة. شارك الكود مع منافسك.');
       await this.ctx.storage.put('match', m);
@@ -170,6 +170,30 @@ export class Room extends DurableObject {
       return json(this.view(m, pid));
     }
 
+    if (action === 'rematch') {
+      if (m.phase !== 'finished') {
+        return json(error('يمكن طلب منافسة جديدة مع نفس الخصم بعد انتهاء المباراة فقط.'));
+      }
+      if (m.players.length < 2) return json(error('لا يوجد منافس محفوظ لإعادة المباراة.'));
+      if (!Array.isArray(m.rematchVotes)) m.rematchVotes = [];
+      if (!m.rematchVotes.includes(pid)) {
+        m.rematchVotes.push(pid);
+        this.push(m, 'طلب ' + me.name + ' متابعة المنافسة مع نفس الخصم.');
+      }
+      if (m.rematchVotes.length >= m.players.length) {
+        m.rematchVotes = [];
+        for (const player of m.players) player.score = 0;
+        m.winner = null;
+        m.created = Date.now();
+        this.start(m);
+        await this.ctx.storage.put('match', m);
+        await this.ctx.storage.setAlarm(Date.now() + ROOM_TTL_MS);
+        return json(this.view(m, pid));
+      }
+      await this.ctx.storage.put('match', m);
+      return json(this.view(m, pid));
+    }
+
     this.tick(m);
     if (action === 'begin') {
       if (m.phase !== 'playing' || m.sub !== 'reading' || m.holder !== pid) {
@@ -208,6 +232,11 @@ export class Room extends DurableObject {
       if (m.phase === 'lobby' && m.players[0].id === pid) {
         await this.ctx.storage.delete('match');
         await this.ctx.storage.deleteAlarm();
+      } else if (m.phase === 'finished') {
+        const votes = Array.isArray(m.rematchVotes) ? m.rematchVotes : [];
+        m.rematchVotes = votes.filter((vote) => vote !== pid);
+        this.push(m, me.name + ' اختار منافسًا جديدًا.');
+        await this.ctx.storage.put('match', m);
       }
       return json({ ok: true, left: true });
     }
@@ -302,6 +331,7 @@ export class Room extends DurableObject {
     const me = this.player(m, pid);
     const opp = this.other(m, pid);
     const isHolder = m.holder === pid && m.phase === 'playing';
+    const rematchVotes = Array.isArray(m.rematchVotes) ? m.rematchVotes : [];
     let status = '';
     let timerTotal = 0;
     if (m.phase === 'lobby') status = 'بانتظار دخول المنافس';
@@ -328,6 +358,8 @@ export class Room extends DurableObject {
       timerTotalMs: timerTotal,
       reveal: m.sub === 'reveal' ? m.reveal : null,
       winner: m.phase === 'finished' ? m.winner : null,
+      youRequestedRematch: rematchVotes.includes(pid),
+      opponentRequestedRematch: rematchVotes.some((vote) => vote !== pid),
       events: m.events.slice(-4).map((e) => e.text),
     };
   }
